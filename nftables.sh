@@ -29,11 +29,10 @@ check_service_status() {
     fi
 }
 
-# 内部函数：检查同步脚本是否存在
+# 内部函数：检查环境
 check_env_installed() {
     if [ ! -f "$UPDATE_SCRIPT" ]; then
-        echo -e "${RED}错误：检测到同步脚本不存在！${PLAIN}"
-        echo -e "${YELLOW}请先选择 1 安装环境。${PLAIN}"
+        echo -e "${RED}错误：请先执行选项 1 安装环境！${PLAIN}"
         return 1
     fi
     return 0
@@ -44,13 +43,7 @@ show_menu() {
     clear
     echo "            欢迎使用 nftables 动态转发脚本"
     echo " ———————————— 内核级转发 | 支持动态域名 ————————————"
-    echo "      修改内容：增加安装前置检查，修复报错逻辑"
-    echo "      "
-    echo "      (1) 首次使用请先执行【安装环境】"
-    echo "      (2) 支持单端口 (如 80) 或端口段 (如 1000-2000)"
-    echo "      (3) 每分钟自动检测域名 IP，变动即更新"
     echo " "
-    echo "——————————————————"
     echo " 1. 安装环境 (nftables + 开启内核转发)"
     echo "——————————————————"
     echo " 2. 添加 转发规则"
@@ -64,116 +57,103 @@ show_menu() {
     echo "——————————————————"
     echo " 0. 退出脚本"
     echo "——————————————————"
-    echo " "
-    echo  "软件状态："
-    echo  "运行状态："
+    echo -e "软件状态：${nft_status_color}${nft_status}${PLAIN}"
+    echo -n "运行状态："
     check_service_status
 }
 
 # 部署环境
 deploy_env() {
-    echo  "正在安装依赖并初始化..."
-    apt-get update && apt-get install  nftables dnsutils cron
+    echo -e "${YELLOW}正在安装依赖并初始化...${PLAIN}"
+    apt-get update && apt-get install -y nftables dnsutils cron
     
     # 开启内核转发
-    sed   /etc/sysctl.conf
-    echo  >> /etc/sysctl.conf
-    sysctl 
+    sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
+    echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+    sysctl -p
 
     # 初始化 nftables 结构
-    cat 
-
-
-
-
+    cat <<EOF > $NFT_CONF
+flush ruleset
+table ip nft_forward {
+    chain prerouting {
+        type nat hook prerouting priority -100;
     }
-
-
+    chain postrouting {
+        type nat hook postrouting priority 100;
     }
-
-
-
+    chain forward {
+        type filter hook forward priority 0;
+        policy accept;
     }
 }
-
-
-
+EOF
+    touch $MAP_FILE
+    create_sync_script
     
-
-
+    systemctl enable nftables
+    systemctl restart nftables
     
-
-
-    echo  "环境部署完成！"
+    nft_status="已安装"
+    nft_status_color=$GREEN
+    echo -e "${GREEN}环境部署完成！${PLAIN}"
 }
 
 # 创建同步脚本
+create_sync_script() {
+    cat <<'EOF' > $UPDATE_SCRIPT
+#!/bin/bash
+MAP_FILE="/etc/nft_mappings.conf"
+nft add table ip nft_forward 2>/dev/null
+nft flush table ip nft_forward
+nft add chain ip nft_forward prerouting { type nat hook prerouting priority -100 \; }
+nft add chain ip nft_forward postrouting { type nat hook postrouting priority 100 \; }
+nft add chain ip nft_forward forward { type filter hook forward priority 0 \; policy accept \; }
 
-
-
-
-
-# 确保表存在
-
-
-# 清空并重建链
-
-
-
-
-
-
-
-    
-
-    
-
-
-
-
-
-
-
-
-    # 设置定时任务
-
+while IFS="|" read l_port r_domain r_port remark; do
+    [[ -z "$l_port" ]] && continue
+    target_ip=$(dig +short "$r_domain" | grep -E '^[0-9.]+$' | head -n1)
+    if [ ! -z "$target_ip" ]; then
+        nft add rule ip nft_forward prerouting tcp dport $l_port dnat to $target_ip:$r_port
+        nft add rule ip nft_forward prerouting udp dport $l_port dnat to $target_ip:$r_port
+        nft add rule ip nft_forward postrouting ip daddr $target_ip masquerade
+    fi
+done < "$MAP_FILE"
+EOF
+    chmod +x $UPDATE_SCRIPT
+    (crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT"; echo "* * * * * $UPDATE_SCRIPT") | crontab -
 }
 
 # 添加规则
-
-
+add_forward() {
+    check_env_installed || return
+    echo -e "${YELLOW}添加新转发：${PLAIN}"
+    read -p "本地监听端口: " l_port
+    read -p "目的地域名/IP: " r_domain
+    read -p "目的地端口: " r_port
+    read -p "备注: " remark
     
-    echo  "添加新转发："
+    if [[ -z "$l_port" || -z "$r_domain" || -z "$r_port" ]]; then
+        echo -e "${RED}错误：必填项不能为空${PLAIN}"
+        return
+    fi
 
-
-
-
-    
-
-        echo  "错误：必填项不能为空"
-
-
-
-
-    
-
+    echo "$l_port|$r_domain|$r_port|$remark" >> $MAP_FILE
+    if $UPDATE_SCRIPT; then
         echo -e "${GREEN}添加并同步成功！${PLAIN}"
-
-        echo -e "${RED}规则已记录，但执行同步失败，请检查 nftables 状态！${PLAIN}"
-
+    else
+        echo -e "${RED}同步失败！${PLAIN}"
+    fi
 }
 
 # 查看规则
-
-
-        echo -e "${RED}规则文件不存在${PLAIN}"
-
-
+show_all_conf() {
+    [ ! -f "$MAP_FILE" ] && touch $MAP_FILE
     echo -e "\n${YELLOW}当前转发规则列表：${PLAIN}"
-
-
-
-
+    echo "--------------------------------------------------------------------------------"
+    printf "%-5s | %-15s | %-25s | %-10s | %-15s\n" "序号" "本地端口" "目的地" "目标端口" "备注"
+    echo "--------------------------------------------------------------------------------"
+    local i=1
 
 
 
@@ -189,7 +169,7 @@ deploy_env() {
 
 
 
-        echo -e "${GREEN}删除成功并已更新内核规则${PLAIN}"
+
 
         echo -e "${RED}输入无效${PLAIN}"
 
@@ -205,12 +185,9 @@ deploy_env() {
 
         echo -e "${GREEN}已彻底卸载${PLAIN}"
 
-
-
 }
 
 # 循环菜单
-
 
 
 
